@@ -1,117 +1,273 @@
-import { useState, useCallback, useRef } from 'react';
-import { RecordingMetadata, RecordingAnalysis, AnalyzeRecordingInput } from '@/types/recording';
-import { analyzeRecording } from '@/lib/analyzeRecording';
+import { useReducer, useCallback, useEffect, useRef } from 'react';
+import { lyrics, feedbacks, demoSong } from '@/data/songs';
+import { useAudioPlayer } from '@/hooks/useAudioPlayer';
+import { RecordingMetadata, RecordingAnalysis } from '@/types/recording';
 
-export interface UseRecordingSessionReturn {
-  recordings: RecordingMetadata[];
-  analyses: Map<string, RecordingAnalysis>;
-  isAnalyzing: boolean;
-  addRecording: (recording: RecordingMetadata) => void;
-  getRecording: (id: string) => RecordingMetadata | undefined;
-  getAnalysis: (recordingId: string) => RecordingAnalysis | undefined;
-  deleteRecording: (id: string) => void;
-  clearAll: () => void;
-  analyzeRecording: (recordingId: string) => Promise<RecordingAnalysis | null>;
-  downloadRecording: (recording: RecordingMetadata) => void;
+export type SessionState = 'idle' | 'playing' | 'paused' | 'recording' | 'analyzing' | 'feedback' | 'next';
+
+export interface SessionStateData {
+  state: SessionState;
+  currentLineIndex: number;
+  currentTime: number;
+  feedbackIndex: number;
 }
 
-export function useRecordingSession(): UseRecordingSessionReturn {
-  const [recordings, setRecordings] = useState<RecordingMetadata[]>([]);
-  const [analyses, setAnalyses] = useState<Map<string, RecordingAnalysis>>(new Map());
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const recordingIdToAnalyzeRef = useRef<string | null>(null);
+type SessionAction =
+  | { type: 'PLAY' }
+  | { type: 'PAUSE' }
+  | { type: 'RECORD' }
+  | { type: 'STOP_RECORD' }
+  | { type: 'ANALYZE' }
+  | { type: 'SHOW_FEEDBACK' }
+  | { type: 'NEXT_LINE' }
+  | { type: 'SKIP_BACK' }
+  | { type: 'SKIP_FORWARD' }
+  | { type: 'RESTART_LINE' }
+  | { type: 'TICK'; payload: number };
 
-  const addRecording = useCallback((recording: RecordingMetadata) => {
-    console.log('[RecordingSession] Adding recording:', recording.id);
-    setRecordings(prev => [...prev, recording]);
-  }, []);
+const initialState: SessionStateData = {
+  state: 'idle',
+  currentLineIndex: 0,
+  currentTime: 0,
+  feedbackIndex: 0,
+};
 
-  const getRecording = useCallback((id: string): RecordingMetadata | undefined => {
-    return recordings.find(r => r.id === id);
-  }, [recordings]);
-
-  const getAnalysis = useCallback((recordingId: string): RecordingAnalysis | undefined => {
-    return analyses.get(recordingId);
-  }, [analyses]);
-
-  const deleteRecording = useCallback((id: string) => {
-    console.log('[RecordingSession] Deleting recording:', id);
-    const recording = recordings.find(r => r.id === id);
-    if (recording) {
-      URL.revokeObjectURL(recording.blobUrl);
-    }
-    setRecordings(prev => prev.filter(r => r.id !== id));
-    setAnalyses(prev => {
-      const next = new Map(prev);
-      next.delete(id);
-      return next;
-    });
-  }, [recordings]);
-
-  const clearAll = useCallback(() => {
-    console.log('[RecordingSession] Clearing all recordings');
-    recordings.forEach(r => URL.revokeObjectURL(r.blobUrl));
-    setRecordings([]);
-    setAnalyses(new Map());
-  }, [recordings]);
-
-  const analyzeRecordingById = useCallback(async (recordingId: string): Promise<RecordingAnalysis | null> => {
-    const recording = recordings.find(r => r.id === recordingId);
-    if (!recording) {
-      console.error('[RecordingSession] Recording not found:', recordingId);
-      return null;
-    }
-
-    console.log('[RecordingSession] Starting analysis for:', recordingId);
-    setIsAnalyzing(true);
-    recordingIdToAnalyzeRef.current = recordingId;
-
-    try {
-      const input: AnalyzeRecordingInput = {
-        recordingBlob: await fetch(recording.blobUrl).then(r => r.blob()),
-        metadata: recording,
+function sessionReducer(state: SessionStateData, action: SessionAction): SessionStateData {
+  switch (action.type) {
+    case 'PLAY':
+      return { ...state, state: 'playing' };
+    
+    case 'PAUSE':
+      return { ...state, state: 'paused' };
+    
+    case 'RECORD':
+      return { ...state, state: 'recording' };
+    
+    case 'STOP_RECORD':
+      return { ...state, state: 'analyzing' };
+    
+    case 'ANALYZE':
+      return { ...state, state: 'analyzing' };
+    
+    case 'SHOW_FEEDBACK':
+      return { 
+        ...state, 
+        state: 'feedback',
+        feedbackIndex: (state.feedbackIndex + 1) % feedbacks.length
       };
-
-      const result = await analyzeRecording(input);
-
-      if (result.success && result.analysis) {
-        console.log('[RecordingSession] Analysis complete:', result.analysis);
-        setAnalyses(prev => new Map(prev).set(recordingId, result.analysis!));
-        return result.analysis;
-      } else {
-        console.error('[RecordingSession] Analysis failed:', result.error);
-        return null;
+    
+    case 'NEXT_LINE': {
+      const nextIndex = state.currentLineIndex + 1;
+      if (nextIndex >= lyrics.length) {
+        return { ...state, state: 'idle', currentLineIndex: 0, currentTime: 0 };
       }
-    } catch (error) {
-      console.error('[RecordingSession] Analysis error:', error);
-      return null;
-    } finally {
-      setIsAnalyzing(false);
-      recordingIdToAnalyzeRef.current = null;
+      return { 
+        ...state, 
+        state: 'next',
+        currentLineIndex: nextIndex,
+        currentTime: lyrics[nextIndex].startTime
+      };
     }
-  }, [recordings]);
+    
+    case 'SKIP_BACK': {
+      const prevIndex = Math.max(0, state.currentLineIndex - 1);
+      return { 
+        ...state, 
+        state: 'idle',
+        currentLineIndex: prevIndex,
+        currentTime: lyrics[prevIndex].startTime
+      };
+    }
+    
+    case 'SKIP_FORWARD': {
+      const nextIndex = Math.min(lyrics.length - 1, state.currentLineIndex + 1);
+      return { 
+        ...state, 
+        state: 'idle',
+        currentLineIndex: nextIndex,
+        currentTime: lyrics[nextIndex].startTime
+      };
+    }
+    
+    case 'RESTART_LINE':
+      return { 
+        ...state, 
+        state: 'idle',
+        currentTime: lyrics[state.currentLineIndex].startTime
+      };
+    
+    case 'TICK':
+      return { ...state, currentTime: action.payload };
+    
+    default:
+      return state;
+  }
+}
 
-  const downloadRecording = useCallback((recording: RecordingMetadata) => {
-    console.log('[RecordingSession] Downloading recording:', recording.id);
-    
-    const link = document.createElement('a');
-    link.href = recording.blobUrl;
-    link.download = `lilt_recording_${recording.lyricLineId}_${recording.timestamp.getTime()}.webm`;
-    link.click();
-    
-    console.log('[RecordingSession] Download started:', link.download);
+export interface UseShadowingSessionProps {
+  recordingSession?: {
+    addRecording: (recording: RecordingMetadata) => void;
+    analyzeRecording: (recordingId: string) => Promise<RecordingAnalysis | null>;
+  };
+}
+
+export interface UseShadowingSessionReturn {
+  state: SessionState;
+  currentLineIndex: number;
+  currentTime: number;
+  feedbackIndex: number;
+  isCompleted: boolean;
+  progress: number;
+  currentLine: typeof lyrics[0];
+  nextLine: typeof lyrics[0] | undefined;
+  totalDuration: number;
+  audioPlayer: ReturnType<typeof useAudioPlayer>;
+  play: () => Promise<void>;
+  pause: () => void;
+  stopRecord: () => void;
+  goToNextLine: () => void;
+  skipBack: () => void;
+  skipForward: () => void;
+  restartLine: () => void;
+  seekTo: (time: number) => void;
+}
+
+export function useShadowingSession(props?: UseShadowingSessionProps): UseShadowingSessionReturn {
+  const [sessionData, dispatch] = useReducer(sessionReducer, initialState);
+  const audioPlayer = useAudioPlayer(demoSong.audioUrl);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const currentRecordingRef = useRef<RecordingMetadata | null>(null);
+
+  const currentLine = lyrics[sessionData.currentLineIndex];
+  const nextLine = lyrics[sessionData.currentLineIndex + 1];
+  const totalDuration = lyrics[lyrics.length - 1].endTime;
+  const progress = (sessionData.currentTime / totalDuration) * 100;
+  const isCompleted = sessionData.currentLineIndex >= lyrics.length - 1 && sessionData.state === 'feedback';
+
+  // Sync time from audio player
+  useEffect(() => {
+    if (sessionData.state === 'playing' && audioPlayer.isPlaying) {
+      dispatch({ type: 'TICK', payload: audioPlayer.currentTime });
+    }
+  }, [audioPlayer.currentTime, audioPlayer.isPlaying, sessionData.state]);
+
+  // Auto-pause when reaching line end
+  useEffect(() => {
+    if (sessionData.state === 'playing') {
+      const currentLyric = lyrics[sessionData.currentLineIndex];
+      
+      if (sessionData.currentTime >= currentLyric.endTime) {
+        audioPlayer.pause();
+        dispatch({ type: 'PAUSE' });
+        
+        timeoutRef.current = setTimeout(() => {
+          dispatch({ type: 'RECORD' });
+        }, 500);
+      }
+    }
+  }, [sessionData.currentTime, sessionData.state, sessionData.currentLineIndex, audioPlayer]);
+
+  // Auto-play when entering next state
+  useEffect(() => {
+    if (sessionData.state === 'next') {
+      timeoutRef.current = setTimeout(() => {
+        play();
+      }, 800);
+    }
+  }, [sessionData.state]);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
   }, []);
+
+  const play = useCallback(async () => {
+    // Seek to current line start if not there
+    if (Math.abs(audioPlayer.currentTime - lyrics[sessionData.currentLineIndex].startTime) > 0.5) {
+      audioPlayer.seekTo(lyrics[sessionData.currentLineIndex].startTime);
+    }
+    
+    await audioPlayer.play();
+    dispatch({ type: 'PLAY' });
+  }, [audioPlayer, sessionData.currentLineIndex]);
+
+  const pause = useCallback(() => {
+    audioPlayer.pause();
+    dispatch({ type: 'PAUSE' });
+  }, [audioPlayer]);
+
+  const stopRecord = useCallback(() => {
+    dispatch({ type: 'STOP_RECORD' });
+    
+    timeoutRef.current = setTimeout(async () => {
+      if (currentRecordingRef.current && props?.recordingSession) {
+        console.log('[ShadowingSession] Saving recording:', currentRecordingRef.current.id);
+        props.recordingSession.addRecording(currentRecordingRef.current);
+        
+        console.log('[ShadowingSession] Starting analysis...');
+        const analysis = await props.recordingSession.analyzeRecording(currentRecordingRef.current.id);
+        
+        if (analysis) {
+          console.log('[ShadowingSession] Analysis complete, showing feedback');
+        }
+      }
+      
+      dispatch({ type: 'SHOW_FEEDBACK' });
+    }, 1500);
+  }, [props?.recordingSession]);
+
+  const goToNextLine = useCallback(() => {
+    currentRecordingRef.current = null;
+    dispatch({ type: 'NEXT_LINE' });
+  }, []);
+
+  const skipBack = useCallback(() => {
+    const targetIndex = Math.max(0, sessionData.currentLineIndex - 1);
+    audioPlayer.seekTo(lyrics[targetIndex].startTime);
+    currentRecordingRef.current = null;
+    dispatch({ type: 'SKIP_BACK' });
+  }, [audioPlayer, sessionData.currentLineIndex]);
+
+  const skipForward = useCallback(() => {
+    const targetIndex = Math.min(lyrics.length - 1, sessionData.currentLineIndex + 1);
+    audioPlayer.seekTo(lyrics[targetIndex].startTime);
+    currentRecordingRef.current = null;
+    dispatch({ type: 'SKIP_FORWARD' });
+  }, [audioPlayer, sessionData.currentLineIndex]);
+
+  const restartLine = useCallback(() => {
+    audioPlayer.seekTo(lyrics[sessionData.currentLineIndex].startTime);
+    currentRecordingRef.current = null;
+    dispatch({ type: 'RESTART_LINE' });
+  }, [audioPlayer, sessionData.currentLineIndex]);
+
+  const seekTo = useCallback((time: number) => {
+    audioPlayer.seekTo(time);
+    dispatch({ type: 'TICK', payload: time });
+  }, [audioPlayer]);
 
   return {
-    recordings,
-    analyses,
-    isAnalyzing,
-    addRecording,
-    getRecording,
-    getAnalysis,
-    deleteRecording,
-    clearAll,
-    analyzeRecording: analyzeRecordingById,
-    downloadRecording,
+    state: sessionData.state,
+    currentLineIndex: sessionData.currentLineIndex,
+    currentTime: sessionData.currentTime,
+    feedbackIndex: sessionData.feedbackIndex,
+    isCompleted,
+    progress,
+    currentLine,
+    nextLine,
+    totalDuration,
+    audioPlayer,
+    play,
+    pause,
+    stopRecord,
+    goToNextLine,
+    skipBack,
+    skipForward,
+    restartLine,
+    seekTo,
   };
 }

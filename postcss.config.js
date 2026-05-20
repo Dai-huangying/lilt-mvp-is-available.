@@ -1,193 +1,117 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { RecordingMetadata } from '@/types/recording';
+import { useState, useCallback, useRef } from 'react';
+import { RecordingMetadata, RecordingAnalysis, AnalyzeRecordingInput } from '@/types/recording';
+import { analyzeRecording } from '@/lib/analyzeRecording';
 
-export type RecorderState = 'idle' | 'requesting' | 'recording' | 'stopped';
-
-export interface UseRecorderReturn {
-  state: RecorderState;
-  audioBlob: Blob | null;
-  blobUrl: string | null;
-  duration: number;
-  waveformData: number[];
-  startRecording: (lyricInfo?: { lyricLineId: number; lyricText: string }) => Promise<void>;
-  stopRecording: () => RecordingMetadata | null;
-  reset: () => void;
+export interface UseRecordingSessionReturn {
+  recordings: RecordingMetadata[];
+  analyses: Map<string, RecordingAnalysis>;
+  isAnalyzing: boolean;
+  addRecording: (recording: RecordingMetadata) => void;
+  getRecording: (id: string) => RecordingMetadata | undefined;
+  getAnalysis: (recordingId: string) => RecordingAnalysis | undefined;
+  deleteRecording: (id: string) => void;
+  clearAll: () => void;
+  analyzeRecording: (recordingId: string) => Promise<RecordingAnalysis | null>;
+  downloadRecording: (recording: RecordingMetadata) => void;
 }
 
-export function useRecorder(): UseRecorderReturn {
-  const [state, setState] = useState<RecorderState>('idle');
-  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [duration, setDuration] = useState(0);
-  const [waveformData, setWaveformData] = useState<number[]>(Array(80).fill(0.3));
-  
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const dataArrayRef = useRef<Uint8Array | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lyricInfoRef = useRef<{ lyricLineId: number; lyricText: string } | null>(null);
+export function useRecordingSession(): UseRecordingSessionReturn {
+  const [recordings, setRecordings] = useState<RecordingMetadata[]>([]);
+  const [analyses, setAnalyses] = useState<Map<string, RecordingAnalysis>>(new Map());
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const recordingIdToAnalyzeRef = useRef<string | null>(null);
 
-  const updateWaveform = useCallback(() => {
-    if (!analyserRef.current || !dataArrayRef.current || state !== 'recording') return;
-    
-    analyserRef.current.getByteFrequencyData(dataArrayRef.current);
-    
-    const normalizedData = Array.from(dataArrayRef.current)
-      .slice(0, 80)
-      .map(value => value / 255);
-    
-    setWaveformData(normalizedData);
-    animationFrameRef.current = requestAnimationFrame(updateWaveform);
-  }, [state]);
+  const addRecording = useCallback((recording: RecordingMetadata) => {
+    console.log('[RecordingSession] Adding recording:', recording.id);
+    setRecordings(prev => [...prev, recording]);
+  }, []);
 
-  const startRecording = useCallback(async (lyricInfo?: { lyricLineId: number; lyricText: string }) => {
-    try {
-      setState('requesting');
-      
-      if (lyricInfo) {
-        lyricInfoRef.current = lyricInfo;
-      }
+  const getRecording = useCallback((id: string): RecordingMetadata | undefined => {
+    return recordings.find(r => r.id === id);
+  }, [recordings]);
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      audioContextRef.current = new AudioContext();
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      source.connect(analyserRef.current);
-      
-      analyserRef.current.fftSize = 256;
-      const bufferLength = analyserRef.current.frequencyBinCount;
-      dataArrayRef.current = new Uint8Array(bufferLength);
-      
-      const mimeType = 'audio/webm';
-      mediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
-      
-      mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          setAudioBlob(event.data);
-        }
-      };
-      
-      mediaRecorderRef.current.start(100);
-      setState('recording');
-      startTimeRef.current = Date.now();
-      setDuration(0);
-      
-      durationIntervalRef.current = setInterval(() => {
-        setDuration(Math.floor((Date.now() - startTimeRef.current) / 1000));
-      }, 100);
-      
-      animationFrameRef.current = requestAnimationFrame(updateWaveform);
-      
-    } catch (error) {
-      console.error('Failed to start recording:', error);
-      setState('idle');
-      throw error;
+  const getAnalysis = useCallback((recordingId: string): RecordingAnalysis | undefined => {
+    return analyses.get(recordingId);
+  }, [analyses]);
+
+  const deleteRecording = useCallback((id: string) => {
+    console.log('[RecordingSession] Deleting recording:', id);
+    const recording = recordings.find(r => r.id === id);
+    if (recording) {
+      URL.revokeObjectURL(recording.blobUrl);
     }
-  }, [updateWaveform]);
+    setRecordings(prev => prev.filter(r => r.id !== id));
+    setAnalyses(prev => {
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+  }, [recordings]);
 
-  const stopRecording = useCallback((): RecordingMetadata | null => {
-    if (mediaRecorderRef.current && state === 'recording') {
-      mediaRecorderRef.current.stop();
-      setState('stopped');
-      
-      if (durationIntervalRef.current) {
-        clearInterval(durationIntervalRef.current);
-        durationIntervalRef.current = null;
-      }
-      
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-      
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-      }
-      
-      if (mediaRecorderRef.current.stream) {
-        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      }
-      
-      const finalDuration = Math.floor((Date.now() - startTimeRef.current) / 1000);
-      const finalBlob = audioBlob;
-      
-      if (finalBlob) {
-        const newBlobUrl = URL.createObjectURL(finalBlob);
-        setBlobUrl(newBlobUrl);
-        
-        const metadata: RecordingMetadata = {
-          id: `rec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          lyricLineId: lyricInfoRef.current?.lyricLineId ?? 0,
-          lyricText: lyricInfoRef.current?.lyricText ?? '',
-          duration: finalDuration,
-          timestamp: new Date(),
-          blobUrl: newBlobUrl,
-          mimeType: 'audio/webm',
-        };
-        
-        console.log('[Recorder] Recording stopped:', {
-          id: metadata.id,
-          duration: metadata.duration,
-          lyric: metadata.lyricText,
-          blobUrl: metadata.blobUrl,
-        });
-        
-        return metadata;
-      }
-      
+  const clearAll = useCallback(() => {
+    console.log('[RecordingSession] Clearing all recordings');
+    recordings.forEach(r => URL.revokeObjectURL(r.blobUrl));
+    setRecordings([]);
+    setAnalyses(new Map());
+  }, [recordings]);
+
+  const analyzeRecordingById = useCallback(async (recordingId: string): Promise<RecordingAnalysis | null> => {
+    const recording = recordings.find(r => r.id === recordingId);
+    if (!recording) {
+      console.error('[RecordingSession] Recording not found:', recordingId);
       return null;
     }
-    return null;
-  }, [state, audioBlob]);
 
-  const reset = useCallback(() => {
-    if (blobUrl) {
-      URL.revokeObjectURL(blobUrl);
+    console.log('[RecordingSession] Starting analysis for:', recordingId);
+    setIsAnalyzing(true);
+    recordingIdToAnalyzeRef.current = recordingId;
+
+    try {
+      const input: AnalyzeRecordingInput = {
+        recordingBlob: await fetch(recording.blobUrl).then(r => r.blob()),
+        metadata: recording,
+      };
+
+      const result = await analyzeRecording(input);
+
+      if (result.success && result.analysis) {
+        console.log('[RecordingSession] Analysis complete:', result.analysis);
+        setAnalyses(prev => new Map(prev).set(recordingId, result.analysis!));
+        return result.analysis;
+      } else {
+        console.error('[RecordingSession] Analysis failed:', result.error);
+        return null;
+      }
+    } catch (error) {
+      console.error('[RecordingSession] Analysis error:', error);
+      return null;
+    } finally {
+      setIsAnalyzing(false);
+      recordingIdToAnalyzeRef.current = null;
     }
-    
-    stopRecording();
-    setAudioBlob(null);
-    setBlobUrl(null);
-    setDuration(0);
-    setWaveformData(Array(80).fill(0.3));
-    setState('idle');
-    lyricInfoRef.current = null;
-  }, [stopRecording, blobUrl]);
+  }, [recordings]);
 
-  useEffect(() => {
-    return () => {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-      }
-      if (durationIntervalRef.current) {
-        clearInterval(durationIntervalRef.current);
-      }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (mediaRecorderRef.current?.stream) {
-        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      }
-      if (blobUrl) {
-        URL.revokeObjectURL(blobUrl);
-      }
-    };
-  }, [blobUrl]);
+  const downloadRecording = useCallback((recording: RecordingMetadata) => {
+    console.log('[RecordingSession] Downloading recording:', recording.id);
+    
+    const link = document.createElement('a');
+    link.href = recording.blobUrl;
+    link.download = `lilt_recording_${recording.lyricLineId}_${recording.timestamp.getTime()}.webm`;
+    link.click();
+    
+    console.log('[RecordingSession] Download started:', link.download);
+  }, []);
 
   return {
-    state,
-    audioBlob,
-    blobUrl,
-    duration,
-    waveformData,
-    startRecording,
-    stopRecording,
-    reset,
+    recordings,
+    analyses,
+    isAnalyzing,
+    addRecording,
+    getRecording,
+    getAnalysis,
+    deleteRecording,
+    clearAll,
+    analyzeRecording: analyzeRecordingById,
+    downloadRecording,
   };
 }
